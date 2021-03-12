@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/jmoiron/sqlx/reflectx"
+	"github.com/guregu/sqlx/reflectx"
 )
 
 // Although the NameMapper is convenient, in practice it should not
@@ -612,7 +612,7 @@ func (r *Rows) StructScan(dest interface{}) error {
 		}
 		m := r.Mapper
 
-		r.fields = m.TraversalsByName(v.Type(), columns)
+		r.fields = traversalsByColumn(m, v.Type(), columns)
 		// if we are not unsafe and are missing fields, return an error
 		if f, err := missingFields(r.fields); err != nil && !r.unsafe {
 			return fmt.Errorf("missing destination name %s in %T", columns[f], dest)
@@ -774,7 +774,7 @@ func (r *Row) scanAny(dest interface{}, structOnly bool) error {
 
 	m := r.Mapper
 
-	fields := m.TraversalsByName(v.Type(), columns)
+	fields := traversalsByColumn(m, v.Type(), columns)
 	// if we are not unsafe and are missing fields, return an error
 	if f, err := missingFields(fields); err != nil && !r.unsafe {
 		return fmt.Errorf("missing destination name %s in %T", columns[f], dest)
@@ -940,7 +940,7 @@ func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
 			m = mapper()
 		}
 
-		fields := m.TraversalsByName(base, columns)
+		fields := traversalsByColumn(m, base, columns)
 		// if we are not unsafe and are missing fields, return an error
 		if f, err := missingFields(fields); err != nil && !isUnsafe(rows) {
 			return fmt.Errorf("missing destination name %s in %T", columns[f], dest)
@@ -1010,6 +1010,67 @@ func baseType(t reflect.Type, expected reflect.Kind) (reflect.Type, error) {
 		return nil, fmt.Errorf("expected %s but got %s", expected, t.Kind())
 	}
 	return t, nil
+}
+
+func traversalsByColumn(m *reflectx.Mapper, typ reflect.Type, columns []string) [][]int {
+	typmap := m.TypeMap(typ)
+	fields := make([][]int, 0, len(columns))
+	for _, col := range columns {
+		var table, alias string
+		if idx := strings.IndexRune(col, '.'); idx != -1 && idx != len(col) {
+			table = col[:idx]
+			alias = col[idx+1:]
+		} else {
+			alias = col
+		}
+
+		// find children of table.*
+		// TODO: probably hangs on recursive types
+		var search func(f *reflectx.FieldInfo) bool
+		search = func(f *reflectx.FieldInfo) bool {
+			if f == nil {
+				return false
+			}
+			for _, child := range f.Children {
+				if child == nil {
+					continue
+				}
+				if child.Name == alias {
+					fields = append(fields, child.Index)
+					return true
+				}
+				if len(child.Children) > 0 {
+					if search(child) {
+						return true
+					}
+				}
+			}
+			return false
+		}
+		if f, ok := typmap.Names[table+".*"]; ok {
+			if search(f) {
+				continue
+			}
+		}
+
+		// exact match
+		if f, ok := typmap.Names[col]; ok {
+			fields = append(fields, f.Index)
+			continue
+		}
+
+		// match on column alias without table
+		if table != "" {
+			if f, ok := typmap.Names[alias]; ok {
+				fields = append(fields, f.Index)
+				continue
+			}
+		}
+
+		// no match
+		fields = append(fields, []int{})
+	}
+	return fields
 }
 
 // fieldsByName fills a values interface with fields from the passed value based
