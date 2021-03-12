@@ -434,7 +434,7 @@ QueueLoop:
 		fld, ok := flds.Paths[fi.Path]
 		if !ok || fld.Embedded {
 			flds.Paths[fi.Path] = fi
-			if fi.Name != "" && !fi.Embedded {
+			if fi.Name != "" {
 				flds.Names[fi.Path] = fi
 			}
 		}
