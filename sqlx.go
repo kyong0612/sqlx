@@ -577,7 +577,7 @@ type Rows struct {
 	Mapper *reflectx.Mapper
 	// these fields cache memory use for a rows during iteration w/ structScan
 	started bool
-	fields  [][]int
+	meta    fieldsMeta
 	values  []interface{}
 }
 
@@ -612,16 +612,16 @@ func (r *Rows) StructScan(dest interface{}) error {
 		}
 		m := r.Mapper
 
-		r.fields = traversalsByColumn(m, v.Type(), columns)
+		r.meta = traversalsByColumn(m, v.Type(), columns)
 		// if we are not unsafe and are missing fields, return an error
-		if f, err := missingFields(r.fields); err != nil && !r.unsafe {
+		if f, err := missingFields(r.meta.fields); err != nil && !r.unsafe {
 			return fmt.Errorf("missing destination name %s in %T", columns[f], dest)
 		}
 		r.values = make([]interface{}, len(columns))
 		r.started = true
 	}
 
-	err := fieldsByTraversal(v, r.fields, r.values, true)
+	err := fieldsByTraversal(v, r.meta, r.values, true)
 	if err != nil {
 		return err
 	}
@@ -774,14 +774,14 @@ func (r *Row) scanAny(dest interface{}, structOnly bool) error {
 
 	m := r.Mapper
 
-	fields := traversalsByColumn(m, v.Type(), columns)
+	meta := traversalsByColumn(m, v.Type(), columns)
 	// if we are not unsafe and are missing fields, return an error
-	if f, err := missingFields(fields); err != nil && !r.unsafe {
+	if f, err := missingFields(meta.fields); err != nil && !r.unsafe {
 		return fmt.Errorf("missing destination name %s in %T", columns[f], dest)
 	}
 	values := make([]interface{}, len(columns))
 
-	err = fieldsByTraversal(v, fields, values, true)
+	err = fieldsByTraversal(v, meta, values, true)
 	if err != nil {
 		return err
 	}
@@ -940,9 +940,9 @@ func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
 			m = mapper()
 		}
 
-		fields := traversalsByColumn(m, base, columns)
+		meta := traversalsByColumn(m, base, columns)
 		// if we are not unsafe and are missing fields, return an error
-		if f, err := missingFields(fields); err != nil && !isUnsafe(rows) {
+		if f, err := missingFields(meta.fields); err != nil && !isUnsafe(rows) {
 			return fmt.Errorf("missing destination name %s in %T", columns[f], dest)
 		}
 		values = make([]interface{}, len(columns))
@@ -952,7 +952,7 @@ func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
 			vp = reflect.New(base)
 			v = reflect.Indirect(vp)
 
-			err = fieldsByTraversal(v, fields, values, true)
+			err = fieldsByTraversal(v, meta, values, true)
 			if err != nil {
 				return err
 			}
@@ -1012,9 +1012,18 @@ func baseType(t reflect.Type, expected reflect.Kind) (reflect.Type, error) {
 	return t, nil
 }
 
-func traversalsByColumn(m *reflectx.Mapper, typ reflect.Type, columns []string) [][]int {
+type fieldsMeta struct {
+	fields []fieldMeta
+}
+
+type fieldMeta struct {
+	traversal []int
+	coalesce  bool
+}
+
+func traversalsByColumn(m *reflectx.Mapper, typ reflect.Type, columns []string) fieldsMeta {
 	typmap := m.TypeMap(typ)
-	fields := make([][]int, 0, len(columns))
+	info := make([]fieldMeta, 0, len(columns))
 	for _, col := range columns {
 		var table, alias string
 		if idx := strings.IndexRune(col, '.'); idx != -1 && idx != len(col) {
@@ -1023,6 +1032,9 @@ func traversalsByColumn(m *reflectx.Mapper, typ reflect.Type, columns []string) 
 		} else {
 			alias = col
 		}
+
+		var trav []int
+		var coal bool
 
 		// find children of table.*
 		// TODO: probably hangs on recursive types
@@ -1035,11 +1047,16 @@ func traversalsByColumn(m *reflectx.Mapper, typ reflect.Type, columns []string) 
 				if child == nil {
 					continue
 				}
+				// TODO: support table name in child.Name?
 				if child.Name == alias {
-					fields = append(fields, child.Index)
+					trav = child.Index
+					_, pcoal := f.Options["coalesce"]
+					_, ccoal := child.Options["coalesce"]
+					coal = pcoal || ccoal
 					return true
 				}
 				if len(child.Children) > 0 {
+					// TODO: CHECK IF DIFFERENT TABLE.*
 					if search(child) {
 						return true
 					}
@@ -1049,28 +1066,43 @@ func traversalsByColumn(m *reflectx.Mapper, typ reflect.Type, columns []string) 
 		}
 		if f, ok := typmap.Names[table+".*"]; ok {
 			if search(f) {
-				continue
+				goto found
 			}
 		}
 
 		// exact match
 		if f, ok := typmap.Names[col]; ok {
-			fields = append(fields, f.Index)
-			continue
+			trav = f.Index
+			_, coal = f.Options["coalesce"]
+			goto found
 		}
 
 		// match on column alias without table
-		if table != "" {
+		if table != "" && trav == nil {
 			if f, ok := typmap.Names[alias]; ok {
-				fields = append(fields, f.Index)
-				continue
+				trav = f.Index
+				_, coal = f.Options["coalesce"]
+				goto found
 			}
 		}
 
-		// no match
-		fields = append(fields, []int{})
+		if trav == nil {
+			// no match
+			info = append(info, fieldMeta{
+				traversal: []int{},
+			})
+			continue
+		}
+
+	found:
+		info = append(info, fieldMeta{
+			traversal: trav,
+			coalesce:  coal,
+		})
 	}
-	return fields
+	return fieldsMeta{
+		fields: info,
+	}
 }
 
 // fieldsByName fills a values interface with fields from the passed value based
@@ -1079,19 +1111,24 @@ func traversalsByColumn(m *reflectx.Mapper, typ reflect.Type, columns []string) 
 // when iterating over many rows.  Empty traversals will get an interface pointer.
 // Because of the necessity of requesting ptrs or values, it's considered a bit too
 // specialized for inclusion in reflectx itself.
-func fieldsByTraversal(v reflect.Value, traversals [][]int, values []interface{}, ptrs bool) error {
+func fieldsByTraversal(v reflect.Value, meta fieldsMeta, values []interface{}, ptrs bool) error {
 	v = reflect.Indirect(v)
 	if v.Kind() != reflect.Struct {
 		return errors.New("argument not a struct")
 	}
 
-	for i, traversal := range traversals {
+	for i, info := range meta.fields {
+		traversal := info.traversal
 		if len(traversal) == 0 {
 			values[i] = new(interface{})
 			continue
 		}
 		f := reflectx.FieldByIndexes(v, traversal)
-		if ptrs {
+		if info.coalesce {
+			values[i] = &coalescer{
+				dest: f,
+			}
+		} else if ptrs {
 			values[i] = f.Addr().Interface()
 		} else {
 			values[i] = f.Interface()
@@ -1100,11 +1137,37 @@ func fieldsByTraversal(v reflect.Value, traversals [][]int, values []interface{}
 	return nil
 }
 
-func missingFields(transversals [][]int) (field int, err error) {
-	for i, t := range transversals {
-		if len(t) == 0 {
+func missingFields(fields []fieldMeta) (field int, err error) {
+	for i, field := range fields {
+		if len(field.traversal) == 0 {
 			return i, errors.New("missing field")
 		}
 	}
 	return 0, nil
+}
+
+// coalescer is a wrapper around scan destinations that sets dest to its zero value if the src is null.
+type coalescer struct {
+	dest reflect.Value
+}
+
+func (c *coalescer) Scan(src interface{}) error {
+	switch src.(type) {
+	case nil:
+		// coalesce null to zero value
+		if !c.dest.CanSet() {
+			return nil
+		}
+		c.dest.Set(reflect.Zero(c.dest.Type()))
+		return nil
+	}
+
+	var iface interface{}
+	if c.dest.CanAddr() {
+		iface = c.dest.Addr().Interface()
+	} else {
+		iface = c.dest.Interface()
+	}
+	// TODO: wish I didn't have to use this...
+	return convertAssign(iface, src)
 }
