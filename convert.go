@@ -186,7 +186,7 @@ func convertAssignRows(dest, src interface{}, rows *Rows) error {
 			return nil
 		}
 	case *bool:
-		bv, err := driver.Bool.ConvertValue(src)
+		bv, err := asBool(src)
 		if err == nil {
 			*d = bv.(bool)
 		}
@@ -350,6 +350,50 @@ func asBytes(buf []byte, rv reflect.Value) (b []byte, ok bool) {
 		return append(buf, s...), true
 	}
 	return
+}
+
+// This function is mirrored in the database/sql/driver package.
+func asBool(src interface{}) (interface{}, error) {
+	switch s := src.(type) {
+	case bool:
+		return s, nil
+	case string:
+		b, err := strconv.ParseBool(s)
+		if err != nil {
+			return nil, fmt.Errorf("sql/driver: couldn't convert %q into type bool", s)
+		}
+		return b, nil
+	case []byte:
+		b, err := strconv.ParseBool(string(s))
+		if err != nil {
+			return nil, fmt.Errorf("sql/driver: couldn't convert %q into type bool", s)
+		}
+		return b, nil
+	}
+
+	sv := reflect.ValueOf(src)
+	switch sv.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		iv := sv.Int()
+		if iv == 1 || iv == 0 {
+			return iv == 1, nil
+		}
+		return nil, fmt.Errorf("sql/driver: couldn't convert %d into type bool", iv)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		uv := sv.Uint()
+		if uv == 1 || uv == 0 {
+			return uv == 1, nil
+		}
+		return nil, fmt.Errorf("sql/driver: couldn't convert %d into type bool", uv)
+	case reflect.Bool:
+		if sv.IsNil() {
+			// return initial value
+			return false, nil
+		}
+		return sv.Bool(), nil
+	}
+
+	return nil, fmt.Errorf("sql/driver: couldn't convert %v (%T) into type bool", src, src)
 }
 
 var valuerReflectType = reflect.TypeOf((*driver.Valuer)(nil)).Elem()
