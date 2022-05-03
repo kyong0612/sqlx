@@ -36,7 +36,6 @@ func init() {
 			BindDriver(driver, bind)
 		}
 	}
-
 }
 
 // BindType returns the bindtype for a given database given a drivername.
